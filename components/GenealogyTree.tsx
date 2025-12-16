@@ -1,3 +1,4 @@
+
 import React, { useEffect, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import * as d3 from 'd3';
@@ -15,6 +16,15 @@ export const GenealogyTree: React.FC = () => {
   const [families, setFamilies] = useState<Family[]>([]);
   const [selectedFamilyId, setSelectedFamilyId] = useState<string>('');
   
+  // Collapse State
+  // Set of Member IDs whose spouse row is collapsed (hiding the spouse row entirely)
+  const [collapsedSpouseRowIds, setCollapsedSpouseRowIds] = useState<Set<string>>(new Set());
+  
+  // Set of Member IDs (can be Father OR Mother) whose children are collapsed/hidden
+  // If a Spouse ID is in here, her children are hidden.
+  // If a Main Member ID is in here, his "motherless" children are hidden.
+  const [collapsedParentIds, setCollapsedParentIds] = useState<Set<string>>(new Set());
+
   // Detail Modal State
   const [viewingMember, setViewingMember] = useState<Member | null>(null);
   const [relatedMembers, setRelatedMembers] = useState<{spouse?: Member[], father?: Member, mother?: Member}>({});
@@ -36,7 +46,7 @@ export const GenealogyTree: React.FC = () => {
   useEffect(() => {
     if (!selectedFamilyId || !svgRef.current || members.length === 0) return;
     renderTree();
-  }, [selectedFamilyId, members]);
+  }, [selectedFamilyId, members, collapsedSpouseRowIds, collapsedParentIds]);
 
   useEffect(() => {
     if (viewingMember) {
@@ -47,10 +57,26 @@ export const GenealogyTree: React.FC = () => {
     }
   }, [viewingMember, members]);
 
+  const toggleSpouseRowCollapse = (id: string, e: any) => {
+    e.stopPropagation();
+    const newSet = new Set(collapsedSpouseRowIds);
+    if (newSet.has(id)) newSet.delete(id);
+    else newSet.add(id);
+    setCollapsedSpouseRowIds(newSet);
+  };
+
+  const toggleChildrenCollapse = (parentId: string, e: any) => {
+    e.stopPropagation();
+    const newSet = new Set(collapsedParentIds);
+    if (newSet.has(parentId)) newSet.delete(parentId);
+    else newSet.add(parentId);
+    setCollapsedParentIds(newSet);
+  };
+
   const renderTree = () => {
     if(!svgRef.current || !wrapperRef.current) return;
 
-    // 1. Data Prep
+    // 1. Data Preparation
     const familyMembers = members.filter(m => m.familyId === selectedFamilyId);
     if(familyMembers.length === 0) {
         d3.select(svgRef.current).selectAll("*").remove();
@@ -59,23 +85,42 @@ export const GenealogyTree: React.FC = () => {
 
     const roots = familyMembers.filter(m => !m.fatherId || !familyMembers.find(fm => fm.id === m.fatherId));
     const rootMember = roots[0];
+    if (!rootMember) return;
 
+    // Build stratify-ready data (flat list with parent pointers)
     const stratifyData = familyMembers.map(m => ({
         id: m.id,
         parentId: (m.fatherId && familyMembers.find(bm => bm.id === m.fatherId)) ? m.fatherId : null,
         data: m
     }));
 
+    // Filter nodes based on collapsedParentIds
+    // We traverse from root. If we encounter a child, we check its mother (or father if no mother).
+    // If that parent is in collapsedParentIds, we do NOT traverse that child.
     const descendants = new Set<string>();
     const queue = [rootMember.id];
+    
     while(queue.length > 0) {
         const currentId = queue.shift()!;
         descendants.add(currentId);
-        const children = stratifyData.filter(d => d.parentId === currentId);
-        children.forEach(c => queue.push(c.id));
+        
+        // Find potential children
+        const potentialChildren = stratifyData.filter(d => d.parentId === currentId);
+        
+        potentialChildren.forEach(childNode => {
+            const child = childNode.data;
+            // Determine the "Effective Parent" for collapsing logic.
+            // Usually it's the mother. If no mother, it's the father.
+            const effectiveParentId = child.motherId || child.fatherId;
+            
+            // If the effective parent is NOT collapsed, we show this child
+            if (effectiveParentId && !collapsedParentIds.has(effectiveParentId)) {
+                queue.push(child.id);
+            }
+        });
     }
+    
     const cleanData = stratifyData.filter(d => descendants.has(d.id));
-
     if (cleanData.length === 0) return;
 
     const root = d3.stratify<any>()
@@ -86,30 +131,35 @@ export const GenealogyTree: React.FC = () => {
     // 2. Layout Configuration
     const nodeWidth = 140;
     const nodeHeight = 70;
-    const spouseVerticalGap = 40; // Gap between husband and wife row
-    const spouseHorizontalGap = 20; // Gap between wives
-    // Level Gap needs to cover: MainNode(70) + Gap(40) + SpouseNode(70) + LineToChild(50+)
+    const spouseVerticalGap = 40; 
+    const spouseHorizontalGap = 20; 
     const levelGap = 260; 
 
-    // Calculate width of the node group (Main + Spouses below) to ensure D3 separates trees enough
-    const getNodeGroupWidth = (d: d3.HierarchyNode<any>) => {
-        const member = d.data.data as Member;
+    // Calculate dynamic node width based on spouses
+    const getNodeGroupMetrics = (member: Member) => {
         const spouseCount = member.spouseIds ? member.spouseIds.length : 0;
-        if (spouseCount === 0) return nodeWidth;
+        const isSpouseRowCollapsed = collapsedSpouseRowIds.has(member.id);
         
-        // Width of the row of spouses
-        const spousesWidth = spouseCount * nodeWidth + (spouseCount - 1) * spouseHorizontalGap;
-        // Return the larger of the two
-        return Math.max(nodeWidth, spousesWidth);
+        let width = nodeWidth;
+        let leftOffset = 0; // Relative to center
+
+        if (spouseCount > 0 && !isSpouseRowCollapsed) {
+            const totalSpousesWidth = spouseCount * nodeWidth + (spouseCount - 1) * spouseHorizontalGap;
+            // The group needs to accommodate the main node AND the spouses below.
+            // We want the main node centered, but the spouses spread out.
+            // D3 Tree treats the node as a point. We need to reserve space.
+            width = Math.max(nodeWidth, totalSpousesWidth);
+        }
+        return { width, spouseCount, isSpouseRowCollapsed };
     };
 
     const treeLayout = d3.tree<any>()
-        .nodeSize([nodeWidth + 40, levelGap])
+        .nodeSize([nodeWidth + 60, levelGap]) // Base size
         .separation((a, b) => {
-             const widthA = getNodeGroupWidth(a);
-             const widthB = getNodeGroupWidth(b);
-             // Factor calculates how many "nodeSizes" apart they should be
-             return (widthA + widthB) / 2 / (nodeWidth + 40) + 0.5; 
+             const metricA = getNodeGroupMetrics(a.data.data);
+             const metricB = getNodeGroupMetrics(b.data.data);
+             // Add extra spacing if nodes are wide due to spouses
+             return (metricA.width + metricB.width) / 2 / (nodeWidth + 60) + 0.5; 
         });
 
     treeLayout(root);
@@ -128,10 +178,45 @@ export const GenealogyTree: React.FC = () => {
 
     svg.call(zoom);
     const bounds = wrapperRef.current.getBoundingClientRect();
-    // Initial centering
     svg.call(zoom.transform, d3.zoomIdentity.translate(bounds.width / 2, 50).scale(0.8));
 
+    // --- Helper: Calculate Coordinates ---
+    
+    // Returns the {x, y} relative to the Node Center (0,0) where the specific parent (Main or Spouse) is located.
+    const getParentVisualOffset = (member: Member, targetParentId: string) => {
+        // If the target is the member themselves (Father/Main)
+        if (targetParentId === member.id) {
+            // If spouses are expanded, the main node is at top (0,0). 
+            // If we have children with NO mother, link comes from bottom of Main card.
+            // BUT wait, if spouses are present, Main card is at y=0. Spouses are at y=110.
+            return { x: 0, y: nodeHeight/2 }; 
+        }
+
+        // If target is a spouse
+        const spouseIndex = member.spouseIds.indexOf(targetParentId);
+        if (spouseIndex !== -1) {
+             const isSpouseRowCollapsed = collapsedSpouseRowIds.has(member.id);
+             if (isSpouseRowCollapsed) {
+                 // Fallback: If spouses hidden but somehow linked (shouldn't happen with filtering),
+                 // point to the toggle button location
+                 return { x: 0, y: nodeHeight/2 + spouseVerticalGap/2 };
+             }
+
+             const spouseCount = member.spouseIds.length;
+             const totalSpousesWidth = spouseCount * nodeWidth + (spouseCount - 1) * spouseHorizontalGap;
+             const startX = -totalSpousesWidth / 2 + nodeWidth / 2;
+             const xPos = startX + spouseIndex * (nodeWidth + spouseHorizontalGap);
+             const yPos = nodeHeight + spouseVerticalGap - nodeHeight/2; // This is the center of spouse card
+             
+             // Return bottom of spouse card + toggle gap
+             return { x: xPos, y: 110 }; // 110 is approx yPos + height/2
+        }
+
+        return { x: 0, y: nodeHeight/2 };
+    };
+
     // --- DRAW LINKS ---
+    // Custom Link Generator
     g.selectAll(".link")
         .data(root.links())
         .enter().append("path")
@@ -140,43 +225,29 @@ export const GenealogyTree: React.FC = () => {
         .attr("stroke", "#CBD5E0")
         .attr("stroke-width", 2)
         .attr("d", (d: any) => {
-            const sourceMember = d.source.data.data as Member;
-            const targetMember = d.target.data.data as Member;
+            const parentMember = d.source.data.data as Member;
+            const childMember = d.target.data.data as Member;
             
-            // Default Source: Bottom of Main Member
-            let sourceX = d.source.x;
-            // Standard bottom of main node
-            let sourceY = d.source.y + nodeHeight / 2; 
+            // Determine who the line should connect to: Mother or Father?
+            // If child has a motherId, and that mother is a spouse of the source, connect to mother.
+            const effectiveParentId = (childMember.motherId && parentMember.spouseIds.includes(childMember.motherId))
+                ? childMember.motherId 
+                : parentMember.id;
 
-            // LOGIC CHANGE: If routing from spouse (Mother)
-            if (targetMember.motherId && sourceMember.spouseIds) {
-                const spouseIndex = sourceMember.spouseIds.indexOf(targetMember.motherId);
-                if (spouseIndex >= 0) {
-                    const spouseCount = sourceMember.spouseIds.length;
-                    const totalSpousesWidth = spouseCount * nodeWidth + (spouseCount - 1) * spouseHorizontalGap;
-                    const startX = d.source.x - totalSpousesWidth / 2;
-                    
-                    // Center of the specific spouse card
-                    sourceX = startX + spouseIndex * (nodeWidth + spouseHorizontalGap) + nodeWidth / 2;
-                    // Bottom of the spouse card (MainY + Height/2 + Gap + Height)
-                    sourceY = d.source.y + nodeHeight/2 + spouseVerticalGap + nodeHeight; 
-                } else {
-                     // Fallback: If no matching spouse found
-                }
-            } else if (sourceMember.spouseIds && sourceMember.spouseIds.length > 0) {
-                // If the man has spouses, but the child has no motherId recorded,
-                // Ideally, we should extend the vertical line down past spouses.
-                sourceY = d.source.y + nodeHeight/2 + spouseVerticalGap + nodeHeight;
-            }
-
+            const offset = getParentVisualOffset(parentMember, effectiveParentId);
+            
+            const startX = d.source.x + offset.x;
+            const startY = d.source.y + offset.y + 20; // +20 for toggle button clearance
+            
             const targetX = d.target.x;
-            const targetY = d.target.y - nodeHeight/2; // Top of child node
+            const targetY = d.target.y - nodeHeight/2;
 
-            return `M${sourceX},${sourceY} 
-                    C${sourceX},${(sourceY + targetY) / 2} 
-                     ${targetX},${(sourceY + targetY) / 2} 
+            return `M${startX},${startY} 
+                    C${startX},${(startY + targetY) / 2} 
+                     ${targetX},${(startY + targetY) / 2} 
                      ${targetX},${targetY}`;
         });
+
 
     // --- DRAW NODES ---
     const node = g.selectAll(".node")
@@ -185,13 +256,10 @@ export const GenealogyTree: React.FC = () => {
         .attr("class", "node")
         .attr("transform", (d: any) => `translate(${d.x},${d.y})`);
 
-    // Helper to draw a single card
+    // Helper: Draw Card
     const drawCard = (selection: any, memberId: string | undefined, xPos: number, yPos: number, isSpouse: boolean) => {
         if (!memberId) return;
-        
-        // Fix: Use a single variable and check it
         const displayMember = members.find(m => m.id === memberId) || DataService.getMembers().find(m => m.id === memberId);
-        
         if (!displayMember) return;
 
         const cardGroup = selection.append("g")
@@ -243,11 +311,10 @@ export const GenealogyTree: React.FC = () => {
             .style("fill", "#718096")
             .text(displayMember.deathDate ? "已故" : `${displayMember.birthDate?.split('-')[0] || '?'}生`);
 
-        // Tag (Spouse Label)
+        // Tag
         if (isSpouse) {
              const family = families.find(f => f.id === displayMember.familyId);
              const familyName = family ? family.name.replace(/.*(?:氏|族)/, '') : '';
-             
              cardGroup.append("rect")
                 .attr("width", 50)
                 .attr("height", 16)
@@ -256,7 +323,6 @@ export const GenealogyTree: React.FC = () => {
                 .attr("rx", 3)
                 .attr("fill", "#ED64A6")
                 .attr("stroke", "#fff");
-             
              cardGroup.append("text")
                 .attr("dy", -nodeHeight/2 + 3)
                 .attr("text-anchor", "middle")
@@ -266,22 +332,64 @@ export const GenealogyTree: React.FC = () => {
         }
     };
 
+    // Helper: Draw Toggle Button
+    const drawToggle = (selection: any, x: number, y: number, isCollapsed: boolean, onClick: (e: any) => void) => {
+        const toggleGroup = selection.append("g")
+            .attr("transform", `translate(${x}, ${y})`)
+            .style("cursor", "pointer")
+            .on("click", onClick);
+
+        toggleGroup.append("circle")
+            .attr("r", 8)
+            .attr("fill", "white")
+            .attr("stroke", "#CBD5E0")
+            .attr("stroke-width", 1.5)
+            .attr("class", "hover:stroke-china-red transition-colors");
+            
+        toggleGroup.append("text")
+            .attr("dy", "3")
+            .attr("text-anchor", "middle")
+            .style("font-size", "10px")
+            .style("font-weight", "bold")
+            .style("fill", "#718096")
+            .style("user-select", "none")
+            .text(isCollapsed ? "+" : "-");
+    };
+
     node.each(function(d: any) {
         const member = d.data.data as Member;
         const self = d3.select(this);
+        const hasSpouses = member.spouseIds && member.spouseIds.length > 0;
+        const isSpouseRowCollapsed = collapsedSpouseRowIds.has(member.id);
+        
+        // Find ALL actual children of this member (from the raw data) to check existence
+        const allChildren = members.filter(m => m.fatherId === member.id);
 
-        // 1. Draw Main Member (Centered at 0,0)
+        // 1. Draw Main Member (Father)
         drawCard(self, member.id, 0, 0, false);
 
-        // 2. Draw Spouses BELOW
-        if (member.spouseIds && member.spouseIds.length > 0) {
-            const spouseCount = member.spouseIds.length;
-            const totalSpousesWidth = spouseCount * nodeWidth + (spouseCount - 1) * spouseHorizontalGap;
-            const startX = -totalSpousesWidth / 2 + nodeWidth / 2; // Start X for the first spouse center
-            const spousesY = nodeHeight + spouseVerticalGap - nodeHeight/2; 
+        // Check if Father has children with no mother (or if he is the only parent recorded)
+        // Usually uncommon in this schema but possible.
+        // We only show toggle if he has children AND no spouses, OR if he has children not linked to spouses.
+        // For simplicity: If there are children with motherId == null, place a toggle under father.
+        const fatherDirectChildren = allChildren.filter(c => !c.motherId);
+        if (fatherDirectChildren.length > 0) {
+             const isCollapsed = collapsedParentIds.has(member.id);
+             // Draw toggle under Father
+             const lineY = hasSpouses ? nodeHeight/2 : nodeHeight/2; // If spouses exist, line goes to spouses, so separate logic.
+             // Actually if spouses exist, the "Spouse Row Toggle" is there. 
+             // Let's put this toggle below the "Spouse Row Toggle" or alongside it?
+             // To keep it clean, if spouses exist, we assume children are linked to spouses.
+             // Only draw Father Toggle if NO Spouses, OR explicit children.
+             if (!hasSpouses) {
+                 self.append("line").attr("x1",0).attr("y1", nodeHeight/2).attr("x2",0).attr("y2", nodeHeight/2 + 20).attr("stroke", "#CBD5E0");
+                 drawToggle(self, 0, nodeHeight/2 + 20, isCollapsed, (e) => toggleChildrenCollapse(member.id, e));
+             }
+        }
 
-            // Draw connecting lines (Bracket style)
-            // Vertical from Main Bottom
+        // 2. Draw Spouses Logic
+        if (hasSpouses) {
+            // Connector to Spouse Row
             self.append("line")
                 .attr("x1", 0)
                 .attr("y1", nodeHeight/2)
@@ -290,32 +398,72 @@ export const GenealogyTree: React.FC = () => {
                 .attr("stroke", "#FF6B6B")
                 .attr("stroke-width", 1.5);
 
-            // Horizontal bar across spouses
-            const leftSpouseX = startX;
-            const rightSpouseX = startX + (spouseCount - 1) * (nodeWidth + spouseHorizontalGap);
-            
-            self.append("line")
-                .attr("x1", leftSpouseX)
-                .attr("y1", nodeHeight/2 + spouseVerticalGap/2)
-                .attr("x2", rightSpouseX)
-                .attr("y2", nodeHeight/2 + spouseVerticalGap/2)
-                .attr("stroke", "#FF6B6B")
-                .attr("stroke-width", 1.5);
+            // Spouse Row Toggle (Global for all spouses)
+            drawToggle(
+                self, 
+                0, 
+                nodeHeight/2 + spouseVerticalGap/2, 
+                isSpouseRowCollapsed, 
+                (e) => toggleSpouseRowCollapse(member.id, e)
+            );
 
-            member.spouseIds.forEach((spouseId, index) => {
-                const xPos = startX + index * (nodeWidth + spouseHorizontalGap);
+            if (!isSpouseRowCollapsed) {
+                const spouseCount = member.spouseIds.length;
+                const totalSpousesWidth = spouseCount * nodeWidth + (spouseCount - 1) * spouseHorizontalGap;
+                const startX = -totalSpousesWidth / 2 + nodeWidth / 2;
+                const spousesY = nodeHeight + spouseVerticalGap - nodeHeight/2; // This is the vertical Center of spouse row
+
+                // Draw Horizontal Bracket
+                const leftSpouseX = startX;
+                const rightSpouseX = startX + (spouseCount - 1) * (nodeWidth + spouseHorizontalGap);
                 
-                // Draw vertical down to specific spouse
                 self.append("line")
-                    .attr("x1", xPos)
+                    .attr("x1", leftSpouseX)
                     .attr("y1", nodeHeight/2 + spouseVerticalGap/2)
-                    .attr("x2", xPos)
-                    .attr("y2", 110 - nodeHeight/2) // To top of spouse card
+                    .attr("x2", rightSpouseX)
+                    .attr("y2", nodeHeight/2 + spouseVerticalGap/2)
                     .attr("stroke", "#FF6B6B")
                     .attr("stroke-width", 1.5);
 
-                drawCard(self, spouseId, xPos, 110, true);
-            });
+                member.spouseIds.forEach((spouseId, index) => {
+                    const xPos = startX + index * (nodeWidth + spouseHorizontalGap);
+                    
+                    // Vertical line to spouse
+                    self.append("line")
+                        .attr("x1", xPos)
+                        .attr("y1", nodeHeight/2 + spouseVerticalGap/2)
+                        .attr("x2", xPos)
+                        .attr("y2", 110 - nodeHeight/2) 
+                        .attr("stroke", "#FF6B6B")
+                        .attr("stroke-width", 1.5);
+
+                    // Draw Spouse Card
+                    drawCard(self, spouseId, xPos, 110, true);
+
+                    // --- CHECK FOR CHILDREN OF THIS SPOUSE ---
+                    const spouseChildren = allChildren.filter(c => c.motherId === spouseId);
+                    if (spouseChildren.length > 0) {
+                        const isChildrenCollapsed = collapsedParentIds.has(spouseId);
+                        
+                        // Connector from Spouse to Toggle
+                        self.append("line")
+                            .attr("x1", xPos)
+                            .attr("y1", 110 + nodeHeight/2) // Bottom of spouse card
+                            .attr("x2", xPos)
+                            .attr("y2", 110 + nodeHeight/2 + 20)
+                            .attr("stroke", "#CBD5E0");
+
+                        // Children Toggle Button (Under Specific Spouse)
+                        drawToggle(
+                            self,
+                            xPos,
+                            110 + nodeHeight/2 + 20,
+                            isChildrenCollapsed,
+                            (e) => toggleChildrenCollapse(spouseId, e)
+                        );
+                    }
+                });
+            }
         }
     });
   };
@@ -343,7 +491,8 @@ export const GenealogyTree: React.FC = () => {
         <div className="absolute bottom-4 right-4 bg-white/90 p-3 rounded-lg shadow border text-xs z-10 backdrop-blur-sm">
             <div className="flex items-center gap-2 mb-2"><span className="w-3 h-3 bg-[#EBF8FF] border border-[#4299E1] rounded block"></span> 男性成员</div>
             <div className="flex items-center gap-2 mb-2"><span className="w-3 h-3 bg-[#FFF5F7] border border-[#ED64A6] rounded block"></span> 女性成员</div>
-            <div className="flex items-center gap-2"><span className="w-8 h-1 border-t border-b border-[#FF6B6B] block"></span> 婚姻关系</div>
+            <div className="flex items-center gap-2 mb-2"><span className="w-8 h-1 border-t border-b border-[#FF6B6B] block"></span> 婚姻关系</div>
+            <div className="flex items-center gap-2"><div className="w-4 h-4 border border-gray-300 rounded-full flex items-center justify-center text-[8px] bg-white">+</div> 折叠节点</div>
         </div>
       </div>
 
