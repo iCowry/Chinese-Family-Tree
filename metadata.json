@@ -1,0 +1,5 @@
+{
+  "name": "*Chinese Genealogy Platform",
+  "description": "A comprehensive family tree and genealogy management system featuring surname tracking, family history management, member profiles, and interactive d3.js visualization.",
+  "requestFramePermissions": []
+}
